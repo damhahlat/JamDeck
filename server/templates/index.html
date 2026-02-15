@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Jam Assist</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+  </head>
+
+  <body>
+    <div class="app">
+      <header class="header">
+        <div>
+          <h1>Jam Assist</h1>
+          <div class="sub">ESP32 controller -> browser audio (in-key)</div>
+        </div>
+
+        <div class="connBox">
+          <div class="connLine">
+            <span class="dot" id="wsDot"></span>
+            <span id="wsStatus">Controller: disconnected</span>
+          </div>
+          <div class="connLine small" id="lastMsg">Last event: -</div>
+        </div>
+      </header>
+
+      <section class="panel">
+        <div class="row wrap">
+          <label>
+            Key
+            <select id="keySelect">
+              <option value="C">C</option>
+              <option value="Db">Db</option>
+              <option value="D">D</option>
+              <option value="Eb">Eb</option>
+              <option value="E">E</option>
+              <option value="F">F</option>
+              <option value="Gb">Gb</option>
+              <option value="G">G</option>
+              <option value="Ab">Ab</option>
+              <option value="A">A</option>
+              <option value="Bb">Bb</option>
+              <option value="B">B</option>
+              <option value="auto">Auto</option>
+            </select>
+          </label>
+
+          <label>
+            Scale Mode
+            <select id="modeSelect">
+              <option value="major">Major</option>
+              <option value="minor">Minor</option>
+            </select>
+          </label>
+
+          <label>
+            Play Mode
+            <select id="playModeSelect">
+              <option value="single">Single</option>
+              <option value="arp">Arpeggio</option>
+              <option value="chord">Chord</option>
+            </select>
+          </label>
+
+          <label>
+            Instrument
+            <select id="instrumentSelect">
+              <option value="flute">Flute</option>
+              <option value="guitar">Guitar</option>
+              <option value="sine">Sine (fallback)</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="row wrap">
+          <button id="startBtn" class="primary">Start Audio</button>
+          <button id="stopBtn">Stop</button>
+
+          <button id="detectBtn" class="detect hidden">
+            Detect Key (5s)
+            <span class="spinner" aria-hidden="true"></span>
+          </button>
+
+          <div class="status" id="status">Audio stopped</div>
+        </div>
+
+        <div class="row wrap">
+          <div class="pill" id="activeKeyDisplay">Active Key: -</div>
+          <div class="pill" id="detectedDisplay">Last Detected Key: -</div>
+          <div class="pill" id="liveInfo">Degree: - | Note: - | Velocity: - | Vibrato: -</div>
+        </div>
+
+        <div class="row">
+          <div class="notesBox">
+            <div class="notesTitle">Notes heard (from the 5s clip)</div>
+            <div id="notesHeard" class="notesHeard">-</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="pad">
+        <h2>Degrees</h2>
+        <div class="degreeGrid" id="degreeGrid">
+          <button class="deg" data-degree="1">1</button>
+          <button class="deg" data-degree="2">2</button>
+          <button class="deg" data-degree="3">3</button>
+          <button class="deg" data-degree="4">4</button>
+          <button class="deg" data-degree="5">5</button>
+          <button class="deg" data-degree="6">6</button>
+          <button class="deg" data-degree="7">7</button>
+          <button class="deg" data-degree="8">8</button>
+        </div>
+        <p class="hint">Keyboard: 1-8. ESP32 can trigger notes, velocity (FSR), vibrato (accelerometer). Flex cycles Play Mode.</p>
+      </section>
+    </div>
+
+    <script src="{{ url_for('static', filename='app.js') }}?v=8"></script>
+  </body>
+</html>
