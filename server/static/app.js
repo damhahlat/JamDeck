@@ -7,10 +7,11 @@ let compressor = null;
 let masterGain = null;
 let isStarted = false;
 
-const activeVoices = new Map(); // voiceId -> { nodes: [{src, gain, baseRate, kind}], meta }
-let currentVelocity = 0.8;      // from FSR
-let vibratoAmount = 0.0;        // 0..1 from accel
-let vibratoHz = 6.0;            // vibrato speed
+const activeVoices = new Map(); // voiceId -> { nodes: [{ src, gain, baseRate, kind, baseFreq? }] }
+
+let currentVelocity = 0.85; // updated by ESP32 FSR
+let vibratoAmount = 0.0;    // updated by ESP32 accel, [0..1]
+let vibratoHz = 6.0;        // LFO rate
 let vibratoTimer = null;
 let vibratoPhase = 0;
 
@@ -35,119 +36,242 @@ const UI = {
 
   wsDot: document.getElementById("wsDot"),
   wsStatus: document.getElementById("wsStatus"),
-  lastMsg: document.getElementById("lastMsg"),
+  lastMsg: document.getElementById("lastMsg")
 };
 
-function setStatus(msg) {
-  UI.status.textContent = msg;
-}
-
-function updateDetectButtonVisibility() {
-  UI.detectBtn.classList.toggle("hidden", UI.keySelect.value !== "auto");
-}
-
-function setDetectLoading(isLoading) {
-  UI.detectBtn.classList.toggle("loading", isLoading);
-}
+/* =========================
+   Utility helpers
+   ========================= */
 
 function clamp(x, a, b) {
   return Math.max(a, Math.min(b, x));
 }
 
+function shuffleArray(arr) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+function ensureAudioStarted() {
+  if (!audioCtx || !isStarted) {
+    setStatus("Click Start Audio first.");
+    return false;
+  }
+  return true;
+}
+
+function setStatus(msg) {
+  if (UI.status) UI.status.textContent = msg;
+}
+
+function connectToOutput(node) {
+  if (!masterGain) return;
+  node.connect(masterGain);
+}
+
 /* =========================
-   Music theory mapping
+   Musical mapping
    ========================= */
 
 const NOTE_TO_PC = {
   "C": 0, "C#": 1, "Db": 1,
   "D": 2, "D#": 3, "Eb": 3,
-  "E": 4, "Fb": 4, "E#": 5,
+  "E": 4,
   "F": 5, "F#": 6, "Gb": 6,
   "G": 7, "G#": 8, "Ab": 8,
   "A": 9, "A#": 10, "Bb": 10,
-  "B": 11, "Cb": 11, "B#": 0
+  "B": 11
 };
+
+const PC_TO_NOTE_FLAT = ["C","Db","D","Eb","E","F","Gb","G","Ab","A","Bb","B"];
 
 const SCALE_INTERVALS = {
   major: [0, 2, 4, 5, 7, 9, 11],
   minor: [0, 2, 3, 5, 7, 8, 10]
 };
 
-let detectedKey = { tonic: "C", mode: "major", confidence: 0 };
-
 function getCurrentKeyMode() {
-  if (UI.keySelect.value === "auto") return detectedKey;
-  return { tonic: UI.keySelect.value, mode: UI.modeSelect.value, confidence: 1 };
+  const tonicRaw = UI.keySelect.value;
+  const mode = UI.modeSelect.value;
+
+  if (tonicRaw === "auto") {
+    return {
+      tonic: autoKey.tonic ?? "C",
+      mode: autoKey.mode ?? "major"
+    };
+  }
+
+  return { tonic: tonicRaw, mode };
 }
 
-function updateActiveKeyUI() {
+function degreeToMidi(degree) {
   const km = getCurrentKeyMode();
-  UI.activeKeyDisplay.textContent = `Active Key: ${km.tonic} ${km.mode}`;
+  const tonicPc = NOTE_TO_PC[km.tonic] ?? 0;
+  const intervals = SCALE_INTERVALS[km.mode] ?? SCALE_INTERVALS.major;
+
+  const deg = clamp(degree, 1, 8);
+  const within = (deg - 1) % 7;
+  const octShift = deg === 8 ? 12 : 0;
+
+  // base octave anchor (C4 = MIDI 60)
+  const base = 60 + tonicPc;
+
+  return base + intervals[within] + octShift;
+}
+
+function degreeToMidiOffset(degree, offsetSteps) {
+  const km = getCurrentKeyMode();
+  const tonicPc = NOTE_TO_PC[km.tonic] ?? 0;
+  const intervals = SCALE_INTERVALS[km.mode] ?? SCALE_INTERVALS.major;
+
+  const idx = (degree - 1 + offsetSteps) % 7;
+  let oct = Math.floor((degree - 1 + offsetSteps) / 7) * 12;
+
+  const base = 60 + tonicPc;
+  return base + intervals[idx] + oct;
 }
 
 function midiToNoteName(midi) {
   const pc = ((midi % 12) + 12) % 12;
-  const names = ["C","C#","D","Eb","E","F","F#","G","Ab","A","Bb","B"];
   const oct = Math.floor(midi / 12) - 1;
-  return `${names[pc]}${oct}`;
+  return `${PC_TO_NOTE_FLAT[pc]}${oct}`;
 }
 
-// degree supports 1..8
-function degreeToMidi(degree) {
-  const { tonic, mode } = getCurrentKeyMode();
-  const tonicPc = NOTE_TO_PC[tonic];
-
-  const d0 = degree - 1;
-  const octaveShift = Math.floor(d0 / 7);
-  const within = ((d0 % 7) + 7) % 7;
-  const interval = SCALE_INTERVALS[mode][within];
-
-  const inst = UI.instrumentSelect.value;
-
-  // Pick a better base register per instrument
-  // Guitar: around C3-C5
-  // Flute: around C4-C6
-  // Sine: middle-ish
-  let baseOctave;
-  let minMidi;
-  let maxMidi;
-
-  if (inst === "guitar") {
-    baseOctave = 3; // C3
-    minMidi = 43;   // about G2
-    maxMidi = 72;   // C5
-  } else if (inst === "flute") {
-    baseOctave = 5; // C5
-    minMidi = 60;   // C4
-    maxMidi = 84;   // C6
-  } else {
-    baseOctave = 4; // C4
-    minMidi = 48;   // C3
-    maxMidi = 84;   // C6
-  }
-
-  let midi = (baseOctave * 12) + tonicPc + interval + 12 * octaveShift;
-
-  while (midi < minMidi) midi += 12;
-  while (midi > maxMidi) midi -= 12;
-
-  return midi;
-}
-
-
-function degreeToMidiOffset(degree, offsetSteps) {
-  const base = degreeToMidi(degree);
-  let target = degreeToMidi(degree + offsetSteps);
-
-  if (offsetSteps > 0) while (target <= base) target += 12;
-  if (offsetSteps < 0) while (target >= base) target -= 12;
-
-  return target;
+function noteNameToMidi(note) {
+  const m = note.match(/^([A-G])([b#]?)(-?\d+)$/);
+  if (!m) return null;
+  const name = m[1] + (m[2] || "");
+  const oct = parseInt(m[3], 10);
+  const pc = NOTE_TO_PC[name];
+  if (pc === undefined) return null;
+  return (oct + 1) * 12 + pc;
 }
 
 /* =========================
-   Sample engine: Flute (single notes)
+   Samples: file lists
    ========================= */
+
+const GUITAR_FILES = [
+  "Guitar.pluck.ff.C3toE3.stereo.wav",
+  "Guitar.pluck.ff.F3toA3.stereo.wav",
+  "Guitar.pluck.ff.Bb3toDb4.stereo.wav",
+  "Guitar.pluck.ff.E4toG4.stereo.wav",
+  "Guitar.pluck.ff.Ab4toB4.stereo.wav",
+  "Guitar.pluck.ff.C5toE5.stereo.wav"
+];
+
+/* =========================
+   Violin samples (arco)
+   Looks for: /static/samples/violin/Violin.arco.ff.sulA.<NOTE><OCT>.stereo.wav
+   Example: Violin.arco.ff.sulA.Ab4.stereo.wav
+   ========================= */
+
+const VIOLIN_NOTE_NAMES = ["C","Db","D","Eb","E","F","Gb","G","Ab","A","Bb","B"];
+const VIOLIN_OCTAVES = [3,4,5,6];
+
+function buildViolinCandidateFiles() {
+  const files = [];
+  for (const oct of VIOLIN_OCTAVES) {
+    for (const n of VIOLIN_NOTE_NAMES) {
+      files.push(`Violin.arco.ff.sulA.${n}${oct}.stereo.wav`);
+    }
+  }
+  return files;
+}
+
+function parseViolinNoteFromFilename(file) {
+  // Violin.arco.ff.sulA.Ab4.stereo.wav -> "Ab4"
+  const m = file.match(/\.([A-G](?:b|#)?)(\d)\.stereo\.wav$/);
+  if (!m) return null;
+  return `${m[1]}${m[2]}`;
+}
+
+let violinSamples = []; // [{ midi, buffer }]
+let violinLoaded = false;
+
+async function loadViolinSamples() {
+  if (!audioCtx) return;
+  if (violinLoaded) return;
+
+  setStatus("Loading violin samples...");
+  const loaded = [];
+
+  const candidates = buildViolinCandidateFiles();
+
+  for (const file of candidates) {
+    const note = parseViolinNoteFromFilename(file);
+    const midi = noteNameToMidi(note);
+    if (midi === null) continue;
+
+    const url = `/static/samples/violin/${file}`;
+    let resp;
+    try {
+      resp = await fetch(url);
+    } catch (e) {
+      continue;
+    }
+    if (!resp.ok) continue;
+
+    const arrayBuf = await resp.arrayBuffer();
+    const buffer = await audioCtx.decodeAudioData(arrayBuf);
+
+    loaded.push({ midi, buffer });
+  }
+
+  violinSamples = loaded.sort((a, b) => a.midi - b.midi);
+  violinLoaded = true;
+
+  setStatus(`Audio running. Loaded ${violinSamples.length} violin samples.`);
+}
+
+function findNearestViolinSample(targetMidi) {
+  if (!violinSamples.length) return null;
+  let best = violinSamples[0];
+  let bestDist = Math.abs(targetMidi - best.midi);
+  for (const s of violinSamples) {
+    const d = Math.abs(targetMidi - s.midi);
+    if (d < bestDist) {
+      best = s;
+      bestDist = d;
+    }
+  }
+  return best;
+}
+
+function playViolinOneShot(midi, {
+  when = audioCtx.currentTime,
+  duration = 0.7,
+  velocity = 0.9
+} = {}) {
+  const sample = findNearestViolinSample(midi);
+  if (!sample) return;
+
+  const src = audioCtx.createBufferSource();
+  src.buffer = sample.buffer;
+
+  const baseRate = Math.pow(2, (midi - sample.midi) / 12);
+  src.playbackRate.value = baseRate;
+
+  const g = audioCtx.createGain();
+  const a = 0.01;
+  const r = 0.08;
+  const peak = clamp(velocity, 0.0001, 1.0);
+
+  g.gain.setValueAtTime(0.0001, when);
+  g.gain.linearRampToValueAtTime(peak, when + a);
+  g.gain.setValueAtTime(peak, when + Math.max(a, duration - r));
+  g.gain.linearRampToValueAtTime(0.0001, when + duration);
+
+  src.connect(g);
+  connectToOutput(g);
+
+  src.start(when);
+  src.stop(when + duration + 0.03);
+}
 
 const FLUTE_FILES = [
   "Flute.vib.ff.A4.stereo.wav","Flute.vib.ff.A5.stereo.wav","Flute.vib.ff.A6.stereo.wav",
@@ -164,20 +288,11 @@ const FLUTE_FILES = [
   "Flute.vib.ff.Gb4.stereo.wav","Flute.vib.ff.Gb5.stereo.wav","Flute.vib.ff.Gb6.stereo.wav"
 ];
 
-function parseFluteNoteFromFilename(filename) {
-  const m = String(filename).match(/\.([A-G])([#b]?)(\d)\./);
+function parseFluteNoteFromFilename(file) {
+  // Flute.vib.ff.Ab4.stereo.wav -> "Ab4"
+  const m = file.match(/\.([A-G](?:b|#)?)(-?\d)\.stereo\.wav$/);
   if (!m) return null;
-  return m[1] + (m[2] || "") + m[3];
-}
-
-function noteNameToMidi(note) {
-  const m = String(note).match(/^([A-G])([#b]?)(\d)$/);
-  if (!m) return null;
-  const name = m[1] + (m[2] || "");
-  const oct = parseInt(m[3], 10);
-  const pc = NOTE_TO_PC[name];
-  if (pc === undefined) return null;
-  return (oct + 1) * 12 + pc;
+  return `${m[1]}${m[2]}`;
 }
 
 let fluteSamples = []; // [{ midi, buffer }]
@@ -201,11 +316,11 @@ async function loadFluteSamples() {
 
     const arrayBuf = await resp.arrayBuffer();
     const buffer = await audioCtx.decodeAudioData(arrayBuf);
-    loaded.push({ midi, buffer, file });
+
+    loaded.push({ midi, buffer });
   }
 
-  loaded.sort((a, b) => a.midi - b.midi);
-  fluteSamples = loaded;
+  fluteSamples = loaded.sort((a, b) => a.midi - b.midi);
   fluteLoaded = true;
 
   setStatus(`Audio running. Loaded ${fluteSamples.length} flute samples.`);
@@ -215,11 +330,10 @@ function findNearestFluteSample(targetMidi) {
   if (!fluteSamples.length) return null;
 
   let best = fluteSamples[0];
-  let bestDist = Math.abs(best.midi - targetMidi);
+  let bestDist = Math.abs(targetMidi - best.midi);
 
-  for (let i = 1; i < fluteSamples.length; i++) {
-    const s = fluteSamples[i];
-    const d = Math.abs(s.midi - targetMidi);
+  for (const s of fluteSamples) {
+    const d = Math.abs(targetMidi - s.midi);
     if (d < bestDist) {
       best = s;
       bestDist = d;
@@ -228,70 +342,27 @@ function findNearestFluteSample(targetMidi) {
   return best;
 }
 
-/* =========================
-   Sample engine: Guitar (range recordings)
-   Assumption: file represents a chromatic run from startNote to endNote.
-   We "seek" into the buffer based on target note index and play a short segment.
-   ========================= */
-
-// IMPORTANT: Put your guitar files here.
-// If you add more, just append them to this list.
-const GUITAR_FILES = [
-  "Guitar.ff.sul_E.C5Bb5.wav",
-  "Guitar.ff.sul_E.E4B4.wav",
-  "Guitar.ff.sulA.A2B2.wav",
-  "Guitar.ff.sulA.C3B3.wav",
-  "Guitar.ff.sulA.C4E4.wav",
-  "Guitar.ff.sulB.B3.wav",          // if this exists as single note, it will work too
-  "Guitar.ff.sulB.C4B4.wav",
-  "Guitar.ff.sulB.C5Gb5.wav",
-  "Guitar.ff.sulD.C4Ab4.wav",
-  "Guitar.ff.sulD.D3B3.wav",
-  "Guitar.ff.sulE.C3B3.wav",
-  "Guitar.ff.sulE.E2B2.wav",
-  "Guitar.ff.sulG.C4B4.wav",
-  "Guitar.ff.sulG.C5Db5.wav",
-  "Guitar.ff.sulG.G3B3.wav",
-
-  "Guitar.mf.sul_E.C5Bb5.wav",
-  "Guitar.mf.sul_E.E4B4.wav",
-  "Guitar.mf.sulA.A2B2.wav",
-  "Guitar.mf.sulA.C3B3.wav",
-  "Guitar.mf.sulA.C4E4.wav"
-];
-
-// Parses either:
-// - Range form: "...<StartNote><EndNote>.wav" eg C3B3, C4Ab4, C5Bb5
-// - Single note form: "...<Note>.wav" eg B3
-function parseGuitarRangeFromFilename(filename) {
-  const base = filename.replace(/^.*\./, "").replace(/\.wav$/i, "");
-
-  // Try range: StartNote + EndNote
-  // Examples: C5Bb5, C4Ab4, A2B2, C5Db5
-  const mRange = filename.match(/\.([A-G])([#b]?)(\d)([A-G])([#b]?)(\d)\.wav$/i);
-  if (mRange) {
-    const start = mRange[1] + (mRange[2] || "") + mRange[3];
-    const end = mRange[4] + (mRange[5] || "") + mRange[6];
-    const startMidi = noteNameToMidi(start);
-    const endMidi = noteNameToMidi(end);
-    if (startMidi === null || endMidi === null) return null;
-    return { startMidi, endMidi, isRange: true };
-  }
-
-  // Try single note: ".B3.wav"
-  const mSingle = filename.match(/\.([A-G])([#b]?)(\d)\.wav$/i);
-  if (mSingle) {
-    const note = mSingle[1] + (mSingle[2] || "") + mSingle[3];
-    const midi = noteNameToMidi(note);
-    if (midi === null) return null;
-    return { startMidi: midi, endMidi: midi, isRange: false };
-  }
-
-  return null;
-}
-
-let guitarSamples = []; // [{ startMidi, endMidi, buffer, file, isRange }]
+let guitarSamples = []; // [{ startMidi, endMidi, isRange, buffer, file }]
 let guitarLoaded = false;
+
+function parseGuitarRangeFromFilename(file) {
+  // Guitar.pluck.ff.C3toE3.stereo.wav
+  const m = file.match(/\.([A-G](?:b|#)?)(-?\d)to([A-G](?:b|#)?)(-?\d)\.stereo\.wav$/);
+  if (!m) return null;
+
+  const n1 = `${m[1]}${m[2]}`;
+  const n2 = `${m[3]}${m[4]}`;
+  const midi1 = noteNameToMidi(n1);
+  const midi2 = noteNameToMidi(n2);
+
+  if (midi1 === null || midi2 === null) return null;
+
+  return {
+    startMidi: midi1,
+    endMidi: midi2,
+    isRange: true
+  };
+}
 
 async function loadGuitarSamples() {
   if (!audioCtx) return;
@@ -329,78 +400,38 @@ async function loadGuitarSamples() {
 function findBestGuitarSample(targetMidi) {
   if (!guitarSamples.length) return null;
 
-  // Prefer a sample whose range contains targetMidi.
+  // Prefer samples whose recorded range contains the target
   const containing = guitarSamples.filter(s => targetMidi >= s.startMidi && targetMidi <= s.endMidi);
   if (containing.length) {
-    // choose the tightest range (more precise)
+    // pick narrowest containing range for best pitch stretch
     containing.sort((a, b) => (a.endMidi - a.startMidi) - (b.endMidi - b.startMidi));
     return containing[0];
   }
 
-  // Else choose closest by range midpoint
+  // Otherwise pick closest by range midpoint
   let best = guitarSamples[0];
-  let bestDist = Math.abs(((best.startMidi + best.endMidi) / 2) - targetMidi);
-
-  for (let i = 1; i < guitarSamples.length; i++) {
-    const s = guitarSamples[i];
+  let bestDist = Math.abs(targetMidi - (best.startMidi + best.endMidi) / 2);
+  for (const s of guitarSamples) {
     const mid = (s.startMidi + s.endMidi) / 2;
-    const d = Math.abs(mid - targetMidi);
+    const d = Math.abs(targetMidi - mid);
     if (d < bestDist) {
       best = s;
       bestDist = d;
     }
   }
-
   return best;
 }
 
 /* =========================
-   Audio primitives
+   Audio playback primitives
    ========================= */
 
-function ensureAudioStarted() {
-  if (!audioCtx || !isStarted) {
-    setStatus("Start Audio first.");
-    return false;
-  }
-  return true;
+function setMasterFromVelocity(velocity) {
+  if (!masterGain) return;
+  // Keep loud, but scale a little with velocity for expressiveness
+  masterGain.gain.value = 1.15 + 0.35 * clamp(velocity, 0.0, 1.0);
 }
 
-function connectToOutput(node) {
-  node.connect(masterGain);
-}
-
-function setMasterFromVelocity(v) {
-  currentVelocity = clamp(v, 0.0, 1.0);
-  if (masterGain && audioCtx) {
-    const now = audioCtx.currentTime;
-    const target = 0.15 + 0.85 * currentVelocity;
-    masterGain.gain.cancelScheduledValues(now);
-    masterGain.gain.setValueAtTime(masterGain.gain.value, now);
-    masterGain.gain.linearRampToValueAtTime(target, now + 0.03);
-  }
-}
-
-function playSineOneShot(midi, { when, duration, velocity }) {
-  const osc = audioCtx.createOscillator();
-  const g = audioCtx.createGain();
-
-  osc.type = "sine";
-  const freq = 440 * Math.pow(2, (midi - 69) / 12);
-  osc.frequency.setValueAtTime(freq, when);
-
-  g.gain.setValueAtTime(0.0001, when);
-  g.gain.linearRampToValueAtTime(clamp(velocity, 0.0001, 1.0), when + 0.01);
-  g.gain.linearRampToValueAtTime(0.0001, when + duration);
-
-  osc.connect(g);
-  connectToOutput(g);
-
-  osc.start(when);
-  osc.stop(when + duration + 0.03);
-}
-
-// Flute one-shot: nearest single-note sample + pitch shift
 function playFluteOneShot(midi, {
   when = audioCtx.currentTime,
   duration = 0.6,
@@ -447,33 +478,58 @@ function playGuitarOneShot(targetMidi, {
   let offset = 0.0;
   let sliceDur = 0.75;
 
-  if (sample.isRange && sample.endMidi > sample.startMidi) {
-    const semis = (sample.endMidi - sample.startMidi) + 1;
-    const seg = sample.buffer.duration / semis;
+  // Map target to a position inside recorded range
+  const range = Math.max(1, sample.endMidi - sample.startMidi);
+  const frac = clamp((targetMidi - sample.startMidi) / range, 0, 1);
 
-    const idx = clamp(targetMidi - sample.startMidi, 0, semis - 1);
-    offset = idx * seg;
+  // Seek into the buffer to approximate the correct fret region
+  // Use up to 60 percent of buffer duration to avoid late decay tail
+  const maxSeek = sample.buffer.duration * 0.6;
+  offset = frac * maxSeek;
 
-    // Slice duration: about 1.4 segments, clamped
-    sliceDur = clamp(seg * 1.4, 0.12, 0.9);
-  }
+  // Pitch correction via playbackRate relative to midpoint reference
+  const refMidi = (sample.startMidi + sample.endMidi) / 2;
+  const rate = Math.pow(2, (targetMidi - refMidi) / 12);
+  src.playbackRate.value = rate;
 
   const g = audioCtx.createGain();
-
-  // Guitar-style envelope: fast attack, longer decay
-  const a = 0.006;
-  const d = 0.45;
-  const peak = clamp(velocity, 0.05, 1.0);
+  const peak = clamp(velocity, 0.0001, 1.0);
 
   g.gain.setValueAtTime(0.0001, when);
-  g.gain.linearRampToValueAtTime(peak, when + a);
-  g.gain.exponentialRampToValueAtTime(0.0001, when + a + d);
+  g.gain.linearRampToValueAtTime(peak, when + 0.005);
+  g.gain.exponentialRampToValueAtTime(0.0001, when + sliceDur);
 
   src.connect(g);
   connectToOutput(g);
 
   src.start(when, offset, sliceDur);
-  src.stop(when + a + d + 0.08);
+  src.stop(when + sliceDur + 0.03);
+}
+
+function playSineOneShot(midi, {
+  when = audioCtx.currentTime,
+  duration = 0.5,
+  velocity = 0.9
+} = {}) {
+  const osc = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+
+  osc.type = "sine";
+  const freq = 440 * Math.pow(2, (midi - 69) / 12);
+  osc.frequency.setValueAtTime(freq, when);
+
+  const peak = clamp(velocity, 0.0001, 1.0);
+
+  g.gain.setValueAtTime(0.0001, when);
+  g.gain.linearRampToValueAtTime(peak, when + 0.01);
+  g.gain.setValueAtTime(peak, when + Math.max(0.02, duration - 0.08));
+  g.gain.linearRampToValueAtTime(0.0001, when + duration);
+
+  osc.connect(g);
+  connectToOutput(g);
+
+  osc.start(when);
+  osc.stop(when + duration + 0.03);
 }
 
 function playNoteMidiOneShot(midi, opts) {
@@ -482,6 +538,11 @@ function playNoteMidiOneShot(midi, opts) {
 
   if (inst === "flute") {
     playFluteOneShot(midi, opts);
+    return;
+  }
+
+  if (inst === "violin") {
+    playViolinOneShot(midi, opts);
     return;
   }
 
@@ -498,8 +559,8 @@ function playNoteMidiOneShot(midi, opts) {
    Guitar is one-shot so vibrato is not applied to it.
    ========================= */
 
-function setVibratoAmount(amount) {
-  vibratoAmount = clamp(amount, 0.0, 1.0);
+function setVibratoAmount(amount01) {
+  vibratoAmount = clamp(amount01, 0, 1);
 }
 
 function startVibratoLoop() {
@@ -512,18 +573,17 @@ function startVibratoLoop() {
     const dt = 0.02;
     vibratoPhase += 2 * Math.PI * vibratoHz * dt;
 
-    const depthCents = 25 * vibratoAmount;
+    const depthCents = 40 * vibratoAmount;
     const cents = depthCents * Math.sin(vibratoPhase);
     const ratio = Math.pow(2, cents / 1200);
 
     for (const voice of activeVoices.values()) {
       for (const n of voice.nodes) {
-        if (n.kind === "sample" && n.baseRate !== null) {
-          n.src.playbackRate.value = n.baseRate * ratio;
-        }
-        if (n.kind === "osc" && n.baseFreq) {
-          n.src.frequency.value = n.baseFreq * ratio;
-        }
+        if (n.kind !== "sample") continue;
+        if (n.baseRate == null) continue;
+        try {
+          n.src.playbackRate.setValueAtTime(n.baseRate * ratio, audioCtx.currentTime);
+        } catch (e) {}
       }
     }
   }, 20);
@@ -536,28 +596,18 @@ function stopVibratoLoop() {
 }
 
 /* =========================
-   Modes: single / chord / arp
-   - For guitar: treat everything as one-shot plucks (no sustain).
+   Play modes: single, chord, arp
    ========================= */
-
-function shuffleArray(arr) {
-  const a = arr.slice();
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [a[i], a[j]] = [a[j], a[i]];
-  }
-  return a;
-}
 
 function startSingle(degree, velocity) {
   const midi = degreeToMidi(degree);
 
   if (UI.instrumentSelect.value === "guitar") {
-    playNoteMidiOneShot(midi, { when: audioCtx.currentTime, duration: 0.75, velocity });
+    playNoteMidiOneShot(midi, { duration: 0.8, velocity });
     return { midi, note: midiToNoteName(midi) };
   }
 
-  // flute/sine sustained behavior
+  // flute, violin, sine sustained behavior
   startSustainedMidiForNonGuitar(midi, `single-${degree}`, velocity);
   return { midi, note: midiToNoteName(midi) };
 }
@@ -571,11 +621,11 @@ function startChord(degree, velocity) {
   const root = degreeToMidi(degree);
   let third = degreeToMidiOffset(degree, 2);
   let fifth = degreeToMidiOffset(degree, 4);
-    if (UI.instrumentSelect.value === "guitar") {
-        root -= 12;
-        third -= 12;
-        fifth -= 12;
-    }
+  if (UI.instrumentSelect.value === "guitar") {
+    // keep guitar chords lower
+    third -= 12;
+    fifth -= 12;
+  }
 
   if (third - root < 4) third += 12;
 
@@ -590,7 +640,7 @@ function startChord(degree, velocity) {
     return { midi: root, note: midiToNoteName(root) };
   }
 
-  // flute/sine sustained chord
+  // flute, violin, sine sustained chord
   return startSustainedChordForNonGuitar(degree, chordNotes, velocity);
 }
 
@@ -627,7 +677,7 @@ function triggerArp(degree, velocity) {
 }
 
 /* =========================
-   Sustained implementation for flute/sine only
+   Sustained implementation for flute/violin/sine
    ========================= */
 
 function startSustainedMidiForNonGuitar(midi, voiceId, velocity = 0.75) {
@@ -658,8 +708,8 @@ function startSustainedMidiForNonGuitar(midi, voiceId, velocity = 0.75) {
     return;
   }
 
-  // flute
-  const sample = findNearestFluteSample(midi);
+  // sample instrument (flute or violin)
+  const sample = (inst === "violin") ? findNearestViolinSample(midi) : findNearestFluteSample(midi);
   if (!sample) return;
 
   const src = audioCtx.createBufferSource();
@@ -715,9 +765,9 @@ function startSustainedChordForNonGuitar(degree, chordNotes, velocity) {
     return { midi: chordNotes[0], note: midiToNoteName(chordNotes[0]) };
   }
 
-  // flute sustained chord
+  // sustained chord for sample instrument (flute or violin)
   for (const m of chordNotes) {
-    const sample = findNearestFluteSample(m);
+    const sample = (inst === "violin") ? findNearestViolinSample(m) : findNearestFluteSample(m);
     if (!sample) continue;
 
     const src = audioCtx.createBufferSource();
@@ -770,6 +820,105 @@ function stopAllVoices() {
 }
 
 /* =========================
+   Auto-key detection UI state
+   ========================= */
+
+let autoKey = {
+  tonic: null,
+  mode: null,
+  confidence: null,
+  notes_heard: null
+};
+
+function updateDetectButtonVisibility() {
+  // Only show detect button if key is Auto
+  if (!UI.detectBtn) return;
+  const isAuto = UI.keySelect.value === "auto";
+  UI.detectBtn.classList.toggle("hidden", !isAuto);
+}
+
+function updateActiveKeyUI() {
+  const km = getCurrentKeyMode();
+  if (UI.activeKeyDisplay) UI.activeKeyDisplay.textContent = `Active Key: ${km.tonic} ${km.mode}`;
+}
+
+function updateDetectedUI() {
+  if (!UI.detectedDisplay) return;
+  if (!autoKey.tonic) {
+    UI.detectedDisplay.textContent = "Last Detected Key: -";
+    return;
+  }
+  UI.detectedDisplay.textContent = `Last Detected Key: ${autoKey.tonic} ${autoKey.mode} (conf ${autoKey.confidence?.toFixed?.(2) ?? "-"})`;
+  if (UI.notesHeard) UI.notesHeard.textContent = Array.isArray(autoKey.notes_heard) ? autoKey.notes_heard.join(", ") : "-";
+}
+
+/* =========================
+   Networking: WebSocket from Flask
+   ========================= */
+
+let ws = null;
+
+function setWsConnected(isConn) {
+  if (!UI.wsDot || !UI.wsStatus) return;
+  UI.wsDot.classList.toggle("on", isConn);
+  UI.wsStatus.textContent = isConn ? "Controller: connected" : "Controller: disconnected";
+}
+
+function setLastMsg(msg) {
+  if (!UI.lastMsg) return;
+  UI.lastMsg.textContent = `Last event: ${msg}`;
+}
+
+function connectWs() {
+  const proto = window.location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${proto}://${window.location.host}/ws`);
+
+  ws.onopen = () => setWsConnected(true);
+  ws.onclose = () => {
+    setWsConnected(false);
+    setTimeout(connectWs, 800);
+  };
+  ws.onerror = () => setWsConnected(false);
+
+  ws.onmessage = (ev) => {
+    let data;
+    try {
+      data = JSON.parse(ev.data);
+    } catch (e) {
+      return;
+    }
+
+    if (!data || !data.type) return;
+
+    if (data.type === "note_on") {
+      setLastMsg(`note_on deg ${data.degree} vel ${data.velocity}`);
+      handleDegreeDown(parseInt(data.degree, 10), parseFloat(data.velocity));
+      return;
+    }
+
+    if (data.type === "note_off") {
+      setLastMsg(`note_off deg ${data.degree}`);
+      handleDegreeUp(parseInt(data.degree, 10));
+      return;
+    }
+
+    if (data.type === "vibrato") {
+      setLastMsg(`vibrato ${data.amount}`);
+      const a = parseFloat(data.amount);
+      if (isFinite(a)) setVibratoAmount(a);
+      updateLiveInfo();
+      return;
+    }
+
+    if (data.type === "flex") {
+      setLastMsg("flex mode cycle");
+      applyFlexCycleMode();
+      return;
+    }
+  };
+}
+
+/* =========================
    Audio start/stop
    ========================= */
 
@@ -779,17 +928,15 @@ async function startAudio() {
   audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   await audioCtx.resume();
 
-  // ---- Master + Compression chain ----
   // masterGain -> compressor -> destination
-
   masterGain = audioCtx.createGain();
 
-  // Louder default volume (was 0.7 before)
-  masterGain.gain.value = 1.35;   // Try 1.35 if you want slightly louder
+  // Louder default volume
+  masterGain.gain.value = 1.35;
 
   compressor = audioCtx.createDynamicsCompressor();
 
-  // Tuned for clean loud output (hackathon friendly)
+  // Tuned for clean loud output
   compressor.threshold.value = -12;
   compressor.knee.value = 30;
   compressor.ratio.value = 6;
@@ -799,8 +946,6 @@ async function startAudio() {
   masterGain.connect(compressor);
   compressor.connect(audioCtx.destination);
 
-  // -------------------------------------
-
   isStarted = true;
 
   startVibratoLoop();
@@ -809,6 +954,7 @@ async function startAudio() {
 
   try {
     if (inst === "flute") await loadFluteSamples();
+    if (inst === "violin") await loadViolinSamples();
     if (inst === "guitar") await loadGuitarSamples();
   } catch (e) {
     console.error(e);
@@ -836,6 +982,8 @@ function stopAudio() {
   fluteSamples = [];
   guitarLoaded = false;
   guitarSamples = [];
+  violinLoaded = false;
+  violinSamples = [];
 
   setStatus("Audio stopped.");
 }
@@ -893,6 +1041,7 @@ function handleDegreeDown(degree, velocity = currentVelocity) {
   setMasterFromVelocity(velocity);
 
   const playMode = UI.playModeSelect.value;
+
   let result = null;
 
   if (playMode === "single") result = startSingle(degree, velocity);
@@ -900,9 +1049,12 @@ function handleDegreeDown(degree, velocity = currentVelocity) {
   if (playMode === "arp") result = triggerArp(degree, velocity);
 
   if (result) {
-    lastPlayed = { degree, note: result.note };
+    lastPlayed.degree = degree;
+    lastPlayed.note = result.note;
     updateLiveInfo();
-    sendDisplayUpdateToBackend(buildDisplayLines(degree, result.note));
+
+    const lines = buildDisplayLines(degree, result.note);
+    sendDisplayUpdateToBackend(lines);
   }
 }
 
@@ -910,320 +1062,80 @@ function handleDegreeUp(degree) {
   const playMode = UI.playModeSelect.value;
   if (playMode === "single") stopSingle(degree);
   if (playMode === "chord") stopChord(degree);
-  // arp does nothing on release
 }
-
-UI.degreeGrid.addEventListener("mousedown", (e) => {
-  const btn = e.target.closest(".deg");
-  if (!btn) return;
-  handleDegreeDown(parseInt(btn.dataset.degree, 10));
-});
-UI.degreeGrid.addEventListener("mouseup", (e) => {
-  const btn = e.target.closest(".deg");
-  if (!btn) return;
-  handleDegreeUp(parseInt(btn.dataset.degree, 10));
-});
-UI.degreeGrid.addEventListener("mouseleave", () => stopAllVoices());
-
-window.addEventListener("keydown", (e) => {
-  if (e.repeat) return;
-  if (e.key >= "1" && e.key <= "8") handleDegreeDown(parseInt(e.key, 10));
-});
-window.addEventListener("keyup", (e) => {
-  if (e.key >= "1" && e.key <= "8") handleDegreeUp(parseInt(e.key, 10));
-});
 
 /* =========================
-   Auto key detection (unchanged)
+   Auto key detect (mic record -> backend)
    ========================= */
 
-function mergeFloat32(buffers) {
-  let total = 0;
-  for (const b of buffers) total += b.length;
-  const out = new Float32Array(total);
-  let offset = 0;
-  for (const b of buffers) {
-    out.set(b, offset);
-    offset += b.length;
-  }
-  return out;
-}
-
-function floatTo16BitPCM(float32) {
-  const out = new Int16Array(float32.length);
-  for (let i = 0; i < float32.length; i++) {
-    let s = Math.max(-1, Math.min(1, float32[i]));
-    out[i] = s < 0 ? s * 32768 : s * 32767;
-  }
-  return out;
-}
-
-function encodeWavMono(samplesFloat32, sampleRate) {
-  const pcm16 = floatTo16BitPCM(samplesFloat32);
-  const byteRate = sampleRate * 2;
-  const blockAlign = 2;
-
-  const buffer = new ArrayBuffer(44 + pcm16.length * 2);
-  const view = new DataView(buffer);
-
-  function writeString(offset, str) {
-    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
-  }
-
-  writeString(0, "RIFF");
-  view.setUint32(4, 36 + pcm16.length * 2, true);
-  writeString(8, "WAVE");
-  writeString(12, "fmt ");
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true);
-  view.setUint16(22, 1, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, byteRate, true);
-  view.setUint16(32, blockAlign, true);
-  view.setUint16(34, 16, true);
-  writeString(36, "data");
-  view.setUint32(40, pcm16.length * 2, true);
-
-  let offset = 44;
-  for (let i = 0; i < pcm16.length; i++, offset += 2) {
-    view.setInt16(offset, pcm16[i], true);
-  }
-
-  return new Blob([view], { type: "audio/wav" });
-}
-
-async function record5sWavFromMic(updateStatus) {
-  const stream = await navigator.mediaDevices.getUserMedia({
-    audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
-  });
-
-  const ctx = audioCtx;
-  const source = ctx.createMediaStreamSource(stream);
-  const processor = ctx.createScriptProcessor(4096, 1, 1);
-
-  const sink = ctx.createGain();
-  sink.gain.value = 0.0;
-  sink.connect(ctx.destination);
-
-  const chunks = [];
-  processor.onaudioprocess = (e) => {
-    const input = e.inputBuffer.getChannelData(0);
-    chunks.push(new Float32Array(input));
-  };
-
-  source.connect(processor);
-  processor.connect(sink);
-
-  const start = performance.now();
-  while (performance.now() - start < 5000) {
-    const leftMs = Math.max(0, 5000 - (performance.now() - start));
-    const secs = Math.ceil(leftMs / 1000);
-    updateStatus(secs);
-    await new Promise((r) => setTimeout(r, 150));
-  }
-
-  source.disconnect();
-  processor.disconnect();
-  stream.getTracks().forEach((t) => t.stop());
-
-  const merged = mergeFloat32(chunks);
-  return encodeWavMono(merged, ctx.sampleRate);
-}
-
-async function fetchWithTimeout(url, options, timeoutMs) {
-  const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...options, signal: controller.signal });
-  } finally {
-    clearTimeout(id);
-  }
-}
-
-async function detectKeyFromMic() {
+async function detectKey() {
   if (!ensureAudioStarted()) return;
-  if (UI.keySelect.value !== "auto") {
-    setStatus("Set Key to Auto to use detection.");
-    return;
-  }
 
-  setDetectLoading(true);
-  UI.notesHeard.textContent = "-";
-  UI.detectedDisplay.textContent = "Last Detected Key: -";
+  UI.detectBtn.disabled = true;
+  UI.detectBtn.classList.add("loading");
 
   try {
-    setStatus("Recording... (5s)");
-    const wavBlob = await record5sWavFromMic((secsLeft) => setStatus(`Recording... ${secsLeft}s`));
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const rec = new MediaRecorder(stream);
 
-    setStatus("Uploading...");
-    const form = new FormData();
-    form.append("audio", wavBlob, "clip.wav");
+    const chunks = [];
+    rec.ondataavailable = (e) => chunks.push(e.data);
 
-    setStatus("Analyzing...");
-    const resp = await fetchWithTimeout("/detect_key", { method: "POST", body: form }, 45000);
-    if (!resp.ok) {
-      setStatus(`Server error: ${resp.status}`);
-      return;
-    }
+    const done = new Promise((resolve) => {
+      rec.onstop = () => resolve();
+    });
+
+    rec.start();
+    await new Promise(r => setTimeout(r, 5000));
+    rec.stop();
+
+    await done;
+    stream.getTracks().forEach(t => t.stop());
+
+    const blob = new Blob(chunks, { type: "audio/webm" });
+    const arrayBuf = await blob.arrayBuffer();
+
+    // Convert webm to wav on backend (analyze_file.py handles conversion)
+    const resp = await fetch("/detect_key", {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: arrayBuf
+    });
+
+    if (!resp.ok) throw new Error("detect_key failed");
 
     const data = await resp.json();
-    if (!data.ok) {
-      setStatus(data.error || "Key detection failed.");
-      return;
-    }
 
-    detectedKey = {
+    autoKey = {
       tonic: data.tonic,
       mode: data.mode,
-      confidence: typeof data.confidence === "number" ? data.confidence : Number(data.confidence || 0)
+      confidence: data.confidence,
+      notes_heard: data.notes_heard
     };
 
-    UI.keySelect.value = data.tonic;
-    UI.modeSelect.value = data.mode;
-
-    updateDetectButtonVisibility();
+    updateDetectedUI();
     updateActiveKeyUI();
-
-    const conf = Number(detectedKey.confidence);
-    UI.detectedDisplay.textContent = `Last Detected Key: ${data.tonic} ${data.mode} (conf ${isFinite(conf) ? conf.toFixed(2) : "-"})`;
-
-    const heard = Array.isArray(data.notes_heard) ? data.notes_heard : [];
-    UI.notesHeard.textContent = heard.length ? heard.join("  ") : "-";
-
-    setStatus(`Detected: ${data.tonic} ${data.mode}`);
-
-    sendDisplayUpdateToBackend({
-      line1: `Key: ${data.tonic} ${data.mode}`,
-      line2: `Detected`
-    });
   } catch (e) {
-    if (String(e).includes("AbortError")) setStatus("Timed out.");
-    else setStatus("Detect failed. Check mic permission.");
+    console.error(e);
+    setStatus("Key detect failed.");
   } finally {
-    setDetectLoading(false);
+    UI.detectBtn.disabled = false;
+    UI.detectBtn.classList.remove("loading");
   }
 }
 
 /* =========================
-   Controller integration (WebSocket)
-   ========================= */
-
-let ws = null;
-let wsReconnectTimer = null;
-
-function setWsUI(connected, text) {
-  UI.wsDot.classList.toggle("good", connected);
-  UI.wsStatus.textContent = text;
-}
-
-function wsUrl() {
-  const proto = location.protocol === "https:" ? "wss" : "ws";
-  return `${proto}://${location.host}/ws`;
-}
-
-function connectWebSocket() {
-  if (ws) {
-    try { ws.close(); } catch (e) {}
-    ws = null;
-  }
-
-  setWsUI(false, "Controller: connecting...");
-
-  ws = new WebSocket(wsUrl());
-
-  ws.onopen = () => {
-    setWsUI(true, "Controller: connected");
-    UI.lastMsg.textContent = "Last event: connected";
-  };
-
-  ws.onclose = () => {
-    setWsUI(false, "Controller: disconnected");
-    UI.lastMsg.textContent = "Last event: disconnected";
-    scheduleReconnect();
-  };
-
-  ws.onerror = () => {
-    setWsUI(false, "Controller: error");
-  };
-
-  ws.onmessage = (ev) => {
-    UI.lastMsg.textContent = `Last event: ${String(ev.data).slice(0, 120)}`;
-
-    let msg = null;
-    try { msg = JSON.parse(ev.data); }
-    catch (e) { return; }
-
-    handleControllerMessage(msg);
-  };
-}
-
-function scheduleReconnect() {
-  if (wsReconnectTimer) return;
-  wsReconnectTimer = setTimeout(() => {
-    wsReconnectTimer = null;
-    connectWebSocket();
-  }, 1200);
-}
-
-function handleControllerMessage(msg) {
-  if (!msg || typeof msg.type !== "string") return;
-
-  if (msg.type === "note_on") {
-    const degree = Number(msg.degree);
-    const vel = clamp(Number(msg.velocity ?? currentVelocity), 0, 1);
-    if (!Number.isFinite(degree)) return;
-    handleDegreeDown(degree, vel);
-    return;
-  }
-
-  if (msg.type === "note_off") {
-    const degree = Number(msg.degree);
-    if (!Number.isFinite(degree)) return;
-    handleDegreeUp(degree);
-    return;
-  }
-
-  if (msg.type === "vibrato") {
-    const amt = clamp(Number(msg.amount), 0, 1);
-    if (!Number.isFinite(amt)) return;
-    setVibratoAmount(amt);
-    updateLiveInfo();
-    return;
-  }
-
-  if (msg.type === "flex" && msg.action === "cycle_mode") {
-    applyFlexCycleMode();
-    return;
-  }
-
-  if (msg.type === "mode_cycle") {
-    applyFlexCycleMode();
-    return;
-  }
-
-  if (msg.type === "state") {
-    if (typeof msg.play_mode === "string") UI.playModeSelect.value = msg.play_mode;
-    if (typeof msg.key === "string") UI.keySelect.value = msg.key;
-    if (typeof msg.scale_mode === "string") UI.modeSelect.value = msg.scale_mode;
-    updateDetectButtonVisibility();
-    updateActiveKeyUI();
-    return;
-  }
-}
-
-/* =========================
-   Wire UI
+   UI event listeners
    ========================= */
 
 UI.startBtn.addEventListener("click", startAudio);
 UI.stopBtn.addEventListener("click", stopAudio);
-UI.detectBtn.addEventListener("click", detectKeyFromMic);
 
 UI.keySelect.addEventListener("change", () => {
   updateDetectButtonVisibility();
   updateActiveKeyUI();
   sendDisplayUpdateToBackend({
-    line1: `Key: ${getCurrentKeyMode().tonic} ${getCurrentKeyMode().mode}`,
+    line1: `Mode: ${UI.playModeSelect.value} Key: ${getCurrentKeyMode().tonic} ${getCurrentKeyMode().mode}`,
     line2: `Ready`
   });
 });
@@ -1231,14 +1143,14 @@ UI.keySelect.addEventListener("change", () => {
 UI.modeSelect.addEventListener("change", () => {
   updateActiveKeyUI();
   sendDisplayUpdateToBackend({
-    line1: `Key: ${getCurrentKeyMode().tonic} ${getCurrentKeyMode().mode}`,
+    line1: `Mode: ${UI.playModeSelect.value} Key: ${getCurrentKeyMode().tonic} ${getCurrentKeyMode().mode}`,
     line2: `Ready`
   });
 });
 
 UI.playModeSelect.addEventListener("change", () => {
   sendDisplayUpdateToBackend({
-    line1: `Mode: ${UI.playModeSelect.value}`,
+    line1: `Mode: ${UI.playModeSelect.value} Key: ${getCurrentKeyMode().tonic} ${getCurrentKeyMode().mode}`,
     line2: `Ready`
   });
 });
@@ -1247,11 +1159,56 @@ UI.instrumentSelect.addEventListener("change", async () => {
   if (!isStarted) return;
   try {
     if (UI.instrumentSelect.value === "flute") await loadFluteSamples();
+    if (UI.instrumentSelect.value === "violin") await loadViolinSamples();
     if (UI.instrumentSelect.value === "guitar") await loadGuitarSamples();
   } catch (e) {}
 });
 
+if (UI.detectBtn) UI.detectBtn.addEventListener("click", detectKey);
+
+// Mouse degree buttons
+if (UI.degreeGrid) {
+  UI.degreeGrid.addEventListener("mousedown", (e) => {
+    const btn = e.target.closest(".deg");
+    if (!btn) return;
+    const degree = parseInt(btn.dataset.degree, 10);
+    handleDegreeDown(degree);
+  });
+
+  UI.degreeGrid.addEventListener("mouseup", (e) => {
+    const btn = e.target.closest(".deg");
+    if (!btn) return;
+    const degree = parseInt(btn.dataset.degree, 10);
+    handleDegreeUp(degree);
+  });
+
+  UI.degreeGrid.addEventListener("mouseleave", (e) => {
+    // stop any held notes if you drag away
+  });
+}
+
+// Keyboard degrees 1-8
+window.addEventListener("keydown", (e) => {
+  if (e.repeat) return;
+  const k = e.key;
+  if (k >= "1" && k <= "8") {
+    handleDegreeDown(parseInt(k, 10));
+  }
+});
+
+window.addEventListener("keyup", (e) => {
+  const k = e.key;
+  if (k >= "1" && k <= "8") {
+    handleDegreeUp(parseInt(k, 10));
+  }
+});
+
+/* =========================
+   Boot
+   ========================= */
+
 updateDetectButtonVisibility();
 updateActiveKeyUI();
+updateDetectedUI();
 updateLiveInfo();
-connectWebSocket();
+connectWs();

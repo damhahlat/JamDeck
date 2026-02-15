@@ -12,11 +12,11 @@
 // ---------------------------
 // FILL THESE IN
 // ---------------------------
-const char* WIFI_SSID = "SSID";
-const char* WIFI_PASS = "PASSWORD";
+const char* WIFI_SSID = "Talha";
+const char* WIFI_PASS = "4167684043";
 
 // Example: http://192.168.0.123:5000
-const char* SERVER_BASE = "FLASK SERVER";
+const char* SERVER_BASE = "http://172.17.247.220:5000";
 
 // ---------------- ADC constants ----------------
 const float VCC = 3.3f;
